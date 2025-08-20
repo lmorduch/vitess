@@ -21,11 +21,20 @@ Functionality of this Executor is tested in go/test/endtoend/onlineddl/...
 package onlineddl
 
 import (
+	"context"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+
+	"vitess.io/vitess/go/mysql/fakesqldb"
+	"vitess.io/vitess/go/sqltypes"
+	"vitess.io/vitess/go/vt/dbconfigs"
+	"vitess.io/vitess/go/vt/vtenv"
+	"vitess.io/vitess/go/vt/vttablet/tabletserver/connpool"
+	"vitess.io/vitess/go/vt/vttablet/tabletserver/tabletenv"
 )
 
 func TestShouldCutOverAccordingToBackoff(t *testing.T) {
@@ -220,4 +229,76 @@ func TestSafeMigrationCutOverThreshold(t *testing.T) {
 			assert.Equal(t, tcase.expect, threshold)
 		})
 	}
+}
+
+func TestAcquireTableLocksTimeout(t *testing.T) {
+	// Create fake SQL DB that will simulate lock contention by blocking
+	db := fakesqldb.New(t)
+	defer db.Close()
+	
+	// Use a pattern to match LOCK TABLES queries
+	lockQueryPattern := "LOCK TABLES.*WRITE.*WRITE"
+	db.AddQueryPattern(lockQueryPattern, &sqltypes.Result{})
+	
+	// Set up blocking behavior for the specific query
+	exactLockQuery := "LOCK TABLES `sentry_table` WRITE, `test_table` WRITE"
+	db.AddQuery(exactLockQuery, &sqltypes.Result{})
+	db.SetBeforeFunc(exactLockQuery, func() {
+		// Block for longer than our timeout to simulate lock contention
+		time.Sleep(12 * time.Second)
+	})
+	
+	// Create proper tabletenv setup
+	cfg := tabletenv.NewDefaultConfig()
+	cfg.DB = dbconfigs.NewTestDBConfigs(*db.ConnParams(), *db.ConnParams(), db.ConnParams().DbName)
+	env := tabletenv.NewEnv(vtenv.NewTestEnv(), cfg, "TestExecutor")
+	
+	// Create connection pool and pooled connection
+	pool := connpool.NewPool(env, "TestPool", tabletenv.ConnPoolConfig{
+		Size:        1,
+		IdleTimeout: 10 * time.Second,
+	})
+	pool.Open(cfg.DB.AppWithDB(), cfg.DB.DbaWithDB(), cfg.DB.AppDebugWithDB())
+	defer pool.Close()
+	
+	pooledConn, err := pool.Get(context.Background(), nil)
+	require.NoError(t, err)
+	defer pooledConn.Recycle()
+	
+	// Add queries that the diagnostic functions will try to execute
+	db.AddQuery("SHOW FULL PROCESSLIST", &sqltypes.Result{})
+	db.AddQuery("SELECT * FROM performance_schema.data_locks", &sqltypes.Result{})
+	
+	// Create a mock executor with minimal setup to avoid panics in diagnostic functions
+	e := &Executor{
+		env:  env,
+		pool: pool,
+	}
+	ctx := context.Background()
+	
+	// Track if reenableWritesOnce was called
+	reenableWritesCalled := false
+	reenableWritesOnce := func() {
+		reenableWritesCalled = true
+	}
+	
+	start := time.Now()
+	err = e.acquireTableLocks(ctx, pooledConn, "sentry_table", "test_table", "test-uuid", reenableWritesOnce)
+	elapsed := time.Since(start)
+	
+	// Verify that the function returned an error due to timeout
+	assert.Error(t, err)
+	// The error can be either context deadline exceeded or MySQL's execution timeout
+	assert.True(t, 
+		strings.Contains(err.Error(), "context deadline exceeded") || 
+		strings.Contains(err.Error(), "maximum statement execution time exceeded"),
+		"Error should indicate a timeout: %v", err)
+	
+	// Verify that the timeout occurred within expected bounds 
+	// Note: Total time includes diagnostic dump attempts which may fail due to connection pool exhaustion
+	assert.Greater(t, elapsed, 9*time.Second, "Lock acquisition should timeout after at least 9 seconds")
+	assert.Less(t, elapsed, 25*time.Second, "Lock acquisition should complete within 25 seconds including diagnostic attempts")
+	
+	// Verify that reenableWritesOnce was called when lock acquisition failed
+	assert.True(t, reenableWritesCalled, "reenableWritesOnce should be called when lock acquisition fails")
 }

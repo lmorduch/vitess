@@ -126,6 +126,7 @@ const (
 	databasePoolSize                         = 3
 	qrBufferExtraTimeout                     = 5 * time.Second
 	grpcTimeout                              = 30 * time.Second
+	vreplicationLockAcquisitionTimeout       = 10 * time.Second
 	vreplicationTestSuiteWaitSeconds         = 5
 )
 
@@ -260,6 +261,57 @@ func (e *Executor) executeQueryWithSidecarDBReplacement(ctx context.Context, que
 		return nil, err
 	}
 	return conn.Conn.Exec(ctx, uq, -1, true)
+}
+
+// dumpProcessList logs the full MySQL process list for debugging lock acquisition failures
+func (e *Executor) dumpProcessList(ctx context.Context, reason string) {
+	log.Infof("Dumping process list due to: %s", reason)
+
+	result, err := e.executeQuery(ctx, "SHOW FULL PROCESSLIST")
+	if err != nil {
+		log.Errorf("Failed to dump process list: %v", err)
+		return
+	}
+
+	log.Infof("Process list:\n%v", result)
+}
+
+func (e *Executor) dumpDataLocks(ctx context.Context, reason string) {
+	log.Infof("Dumping data locks due to: %s", reason)
+
+	result, err := e.executeQuery(ctx, "SELECT * FROM performance_schema.data_locks")
+	if err != nil {
+		log.Errorf("Failed to get data locks: %v", err)
+		return
+	}
+
+	log.Infof("Data locks:\n%v", result)
+}
+
+// dumpLockDiagnosticInfo logs comprehensive diagnostic information for debugging lock issues
+func (e *Executor) dumpLockDiagnosticInfo(ctx context.Context, reason string) {
+	log.Infof("Dumping lock diagnostic info due to: %s", reason)
+
+	e.dumpProcessList(ctx, reason)
+	e.dumpDataLocks(ctx, reason)
+}
+
+// acquireTableLocks attempts to acquire locks on the sentry table and migration table with a reduced timeout
+func (e *Executor) acquireTableLocks(ctx context.Context, lockConn *connpool.PooledConn, sentryTableName, migrationTable, uuid string, reenableWritesOnce func()) error {
+	lockCtx, cancel := context.WithTimeout(ctx, vreplicationLockAcquisitionTimeout)
+	defer cancel()
+	lockTableQuery := sqlparser.BuildParsedQuery(sqlLockTwoTablesWrite, sentryTableName, migrationTable)
+	if _, err := lockConn.Conn.Exec(lockCtx, lockTableQuery.Query, 1, false); err != nil {
+		log.Errorf("acquireTableLocks: LOCK TABLES failed for migration %s: %v", uuid, err)
+		// re-enable writes at this point. When we return below the deferred re-enable would kick in, but we want to
+		// re-enable writes NOW, so we can take our time dumping data about locks below.
+		reenableWritesOnce()
+		diagnosticDumpContext, diagnosticDumpCancel := context.WithTimeout(ctx, defaultCutOverThreshold)
+		defer diagnosticDumpCancel()
+		e.dumpLockDiagnosticInfo(diagnosticDumpContext, fmt.Sprintf("LOCK TABLES failed: %v", err))
+		return err
+	}
+	return nil
 }
 
 // TabletAliasString returns tablet alias as string (duh)
@@ -1017,10 +1069,7 @@ func (e *Executor) cutOverVReplMigration(ctx context.Context, s *VReplStream, sh
 		// real production
 
 		e.updateMigrationStage(ctx, onlineDDL.UUID, "locking tables")
-		lockCtx, cancel := context.WithTimeout(ctx, onlineDDL.CutOverThreshold)
-		defer cancel()
-		lockTableQuery := sqlparser.BuildParsedQuery(sqlLockTwoTablesWrite, sentryTableName, onlineDDL.Table)
-		if _, err := lockConn.Conn.Exec(lockCtx, lockTableQuery.Query, 1, false); err != nil {
+		if err := e.acquireTableLocks(ctx, lockConn, sentryTableName, onlineDDL.Table, onlineDDL.UUID, reenableWritesOnce); err != nil {
 			return vterrors.Wrapf(err, "failed locking tables")
 		}
 
